@@ -1,0 +1,179 @@
+name: Build OrangeFox (haotian)
+
+# 在 GitHub Actions 上编译 Xiaomi 15 Pro (haotian / sm8750_thales) 的 OrangeFox R12。
+#
+# 用法：仓库 → Actions → Build OrangeFox (haotian) → Run workflow。
+# 仓库必须是 public（public runner 是 4 核 16 GB，且不扣分钟数）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_branch:
+        description: 'OrangeFox 清单分支'
+        required: true
+        default: 'fox_16.0'
+      lunch_target:
+        description: 'lunch 目标'
+        required: true
+        default: 'twrp_sm8750_thales-bp2a-eng'
+      build_target:
+        description: 'mka 目标'
+        required: true
+        default: 'adbd recoveryimage'
+
+env:
+  DEVICE_TREE: https://github.com/JunyiWang2004/twrp_device_xiaomi_sm8750_thales
+  DEVICE_TREE_BRANCH: fox_16.0
+  DEVICE_PATH: device/xiaomi/sm8750_thales
+  DEVICE_NAME: sm8750_thales
+  SRC: ${{ github.workspace }}/fox
+
+jobs:
+  build:
+    name: OrangeFox ${{ inputs.manifest_branch }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Add swap
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 16
+
+      - name: Report space before we start
+        run: |
+          df -h /
+          free -h
+          nproc
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git gnupg flex bison gperf zip unzip curl wget \
+            zlib1g-dev libc6-dev libncurses-dev libx11-dev libgl1-mesa-dev \
+            libxml2-utils xsltproc ccache rsync bc libssl-dev libelf-dev \
+            openjdk-17-jdk python3 python-is-python3 fontconfig \
+            lz4 zstd patchelf imagemagick libarchive-tools device-tree-compiler
+
+      - name: Install repo tool
+        run: |
+          mkdir -p ~/bin
+          curl -fsSL --retry 5 --retry-all-errors \
+            https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@users.noreply.github.com"
+
+      - name: repo init (OrangeFox, shallow)
+        run: |
+          set -euo pipefail
+          mkdir -p "$SRC"
+          cd "$SRC"
+          repo init --depth=1 \
+            -u https://gitlab.com/OrangeFox/Manifest.git \
+            -b ${{ inputs.manifest_branch }}
+          echo "=== df after init ==="
+          df -h /
+
+      - name: repo sync
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+          repo sync -c -j$(nproc --all) --no-tags --no-clone-bundle --force-sync
+          echo "=== synced size ==="
+          du -sh "$SRC"
+          echo "=== df after sync ==="
+          df -h /
+
+      - name: Drop .repo to reclaim space
+        run: |
+          set -euo pipefail
+          rm -rf "$SRC/.repo"
+          echo "=== df after dropping .repo ==="
+          df -h /
+
+      - name: Clone device tree (fox_16.0)
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+          rm -rf "$DEVICE_PATH"
+          mkdir -p "$(dirname "$DEVICE_PATH")"
+          git clone --depth=1 -b "$DEVICE_TREE_BRANCH" "$DEVICE_TREE" "$DEVICE_PATH"
+          echo "=== device tree head ==="
+          git -C "$DEVICE_PATH" log --oneline -1
+          ls "$DEVICE_PATH"
+          df -h /
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cd "$SRC"
+          export LC_ALL=C
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export FOX_BUILD_DEVICE="$DEVICE_NAME"
+
+          source build/envsetup.sh
+          lunch ${{ inputs.lunch_target }}
+
+          echo "=== lunch done, starting mka ==="
+          df -h /
+          set +e
+          mka ${{ inputs.build_target }} 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::build failed (rc=$RC)"
+            tail -n 120 "$GITHUB_WORKSPACE/build.log" || true
+          fi
+          exit "$RC"
+
+      - name: Verify image (ramdisk-only, <= recovery partition size)
+        if: success()
+        run: |
+          set -uo pipefail
+          OUT="$SRC/out/target/product/$DEVICE_NAME"
+          echo "=== out dir ==="
+          ls -l "$OUT" | head -40 || true
+
+          IMG="$(ls "$OUT"/OrangeFox*.img 2>/dev/null | head -1)"
+          [ -n "$IMG" ] || IMG="$(ls "$OUT"/recovery.img 2>/dev/null | head -1)"
+          [ -n "$IMG" ] || { echo "::error::no recovery image produced"; exit 1; }
+          echo "image = $IMG"
+          ls -l "$IMG"
+
+          python3 - "$IMG" <<'PY'
+          import struct, sys, os
+          p = sys.argv[1]
+          d = open(p, 'rb').read(4096)
+          assert d[:8] == b'ANDROID!', 'not an Android boot image'
+          kernel_size, ramdisk_size = struct.unpack_from('<II', d, 8)
+          header_version = struct.unpack_from('<I', d, 40)[0]
+          size = os.path.getsize(p)
+          print('kernel_size   =', kernel_size)
+          print('ramdisk_size  =', ramdisk_size)
+          print('header_version=', header_version)
+          print('file_size     =', size)
+          ok = (kernel_size == 0) and (size <= 104857600)
+          print('RESULT:', 'OK' if ok else 'FAIL')
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Upload image and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orangefox-${{ github.run_id }}
+          path: |
+            fox/out/target/product/sm8750_thales/OrangeFox*.img
+            fox/out/target/product/sm8750_thales/OrangeFox*.zip
+            fox/out/target/product/sm8750_thales/recovery.img
+            build.log
+          if-no-files-found: warn
